@@ -1,10 +1,10 @@
-
 import socket
+
+from http.parser import parse_request, HTTPParseError
 
 
 HOST = "127.0.0.1"
 PORT = 8080
-BUFFER_SIZE = 1024
 
 
 def start_server():
@@ -14,56 +14,56 @@ def start_server():
     )
 
     try:
+        server_socket.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1
+        )
+
         server_socket.bind((HOST, PORT))
         server_socket.listen()
 
         print(f"Server listening on {HOST}:{PORT}")
-        print("Waiting for incoming connections...\n")
 
         while True:
-            conn, client_address = server_socket.accept()
+            print("Waiting for incoming connections...")
 
-            try:
-                client_ip, client_port = client_address
+            client_socket, client_address = server_socket.accept()
 
+            with client_socket:
+                print("\n" + "=" * 60)
+                print(f"Client connected: {client_address[0]}:{client_address[1]}")
+
+                try:
+                    request = parse_request(client_socket)
+
+                    print("\nParsed HTTP Request:")
+                    print(f"Method:  {request.method}")
+                    print(f"Path:    {request.path}")
+                    print(f"Version: {request.version}")
+
+                    print("\nHeaders:")
+                    for name, value in request.headers.items():
+                        print(f"{name}: {value}")
+
+                    print(f"\nBody length: {len(request.body)} bytes")
+                    print(f"Body: {request.body!r}")
+
+                except HTTPParseError as error:
+                    print(f"\nHTTP Request Parsing Error: {error}")
+
+                except OSError as error:
+                    print(f"\nSocket Error: {error}")
+
+                print("\nClient connection closed.")
                 print("=" * 60)
-                print(f"Client connected: {client_ip}:{client_port}")
-
-                raw_data = conn.recv(BUFFER_SIZE)
-
-                print("\nRaw HTTP Request (bytes):")
-                print(raw_data)
-
-                decoded_data = raw_data.decode(
-                    "utf-8",
-                    errors="replace"
-                )
-
-                print("\nDecoded HTTP Request:")
-                print(decoded_data)
-
-                print("=" * 60)
-                print()
-
-            except ConnectionResetError:
-                print("Client connection was reset.")
-
-            except OSError as error:
-                print(f"Client connection error: {error}")
-
-            finally:
-                conn.close()
-                print("Client connection closed.\n")
 
     except KeyboardInterrupt:
-        print("\nServer shutdown requested.")
-
-    except OSError as error:
-        print(f"Server error: {error}")
+        print("\nServer shutting down...")
 
     finally:
         server_socket.close()
-        print("Server socket closed.")
+        print("Server stopped.")
 
 
 if __name__ == "__main__":
