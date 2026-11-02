@@ -53,3 +53,30 @@ Press:
 Ctrl + C
 
 The server will close its socket gracefully.
+
+# Python HTTP Server - Phase 2
+
+A basic HTTP request parser built using Python's standard library
+and TCP sockets.
+
+## Features
+
+- HTTP request line parsing
+- HTTP method, path and version extraction
+- Case-insensitive HTTP headers
+- Content-Length validation
+- Exact request body reading
+- Support for request bodies larger than 1024 bytes
+- Rejection of unsupported chunked transfer encoding
+- Structured Request dataclass
+- Unit tests using unittest
+
+## Requirements
+
+- Python 3.10 or newer
+- No third-party dependencies
+
+## Run the server
+
+```bash
+python server.py
