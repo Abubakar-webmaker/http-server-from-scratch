@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -6,5 +6,5 @@ class Request:
     method: str
     path: str
     version: str
-    headers: dict[str, str]
-    body: bytes
+    headers: dict[str, str] = field(default_factory=dict)
+    body: bytes = b""
