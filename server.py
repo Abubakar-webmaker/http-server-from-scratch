@@ -1,211 +1,283 @@
+
+"""
+Custom Python HTTP Server - Phase 4.
+
+TCP handling, HTTP parsing, routing, and response
+serialization remain separate responsibilities.
+"""
+
 import json
-import logging
 import socket
 
 from http.parser import parse_request, HTTPParseError
 from http.response import Response, serialize_response
+from routing import Router
 
 
-HOST = "127.0.0.1"
-PORT = 8080
+class HTTPServer:
+    def __init__(
+        self,
+        host="127.0.0.1",
+        port=8080
+    ):
+        self.host = host
+        self.port = port
+        self.router = Router()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+    def get(self, path, handler):
+        self.router.get(path, handler)
 
+    def post(self, path, handler):
+        self.router.post(path, handler)
 
-def create_error_response(status_code: int, message: str) -> Response:
-    return Response(
-        status_code=status_code,
-        headers={
-            "Content-Type": "text/plain; charset=utf-8"
-        },
-        body=message
-    )
-
-
-def handle_request(request, users: list) -> Response:
-    """
-    Select a response based on the parsed HTTP request.
-    """
-
-    # GET /
-    if request.method == "GET" and request.path == "/":
-        html_body = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Python HTTP Server</title>
-</head>
-<body>
-    <h1>Hello World</h1>
-    <p>Welcome to my Python HTTP Server.</p>
-    <p>Phase 3: HTTP Response Generation is working.</p>
-</body>
-</html>
-"""
-
+    @staticmethod
+    def _internal_error():
         return Response(
-            status_code=200,
+            status_code=500,
             headers={
-                "Content-Type": "text/html; charset=utf-8"
+                "Content-Type": "text/plain; charset=utf-8"
             },
-            body=html_body
+            body=b"500 - Internal Server Error",
         )
 
-    # POST /users
-    if request.method == "POST" and request.path == "/users":
+    def handle_request(self, request):
+        return self.router.dispatch(request)
 
+    def handle_client(self, client_socket):
         try:
-            payload = json.loads(request.body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return create_error_response(
-                400,
-                "Invalid JSON request body."
-            )
-
-        if not isinstance(payload, dict):
-            return create_error_response(
-                400,
-                "Request body must be a JSON object."
-            )
-
-        name = payload.get("name")
-
-        if not isinstance(name, str) or not name.strip():
-            return create_error_response(
-                400,
-                "A valid name is required."
-            )
-
-        # Create an actual in-memory test resource.
-        user = {
-            "id": len(users) + 1,
-            "name": name.strip()
-        }
-
-        users.append(user)
-
-        return Response(
-            status_code=201,
-            headers={
-                "Content-Type": "application/json; charset=utf-8"
-            },
-            body=json.dumps(user, ensure_ascii=False)
-        )
-
-    # Unknown path or unsupported route.
-    return create_error_response(
-        404,
-        "The requested resource was not found."
-    )
-
-
-def handle_client(client_socket, client_address, users):
-    """
-    Parse one request, generate its response and send it.
-    """
-
-    with client_socket:
-        logging.info(
-            "Client connected: %s:%s",
-            client_address[0],
-            client_address[1]
-        )
-
-        try:
-            # Phase 2: Parse the incoming request.
             request = parse_request(client_socket)
 
-            logging.info(
-                "Request received: %s %s %s",
-                request.method,
-                request.path,
-                request.version
-            )
+            response = self.handle_request(request)
 
-            # Phase 3: Generate the appropriate response.
-            response = handle_request(request, users)
-
-        except HTTPParseError as error:
-            logging.warning("Malformed HTTP request: %s", error)
-
-            response = create_error_response(
-                400,
-                "Bad Request"
+        except HTTPParseError:
+            response = Response(
+                status_code=400,
+                headers={
+                    "Content-Type": "text/plain; charset=utf-8"
+                },
+                body=b"400 - Bad Request",
             )
 
         except Exception:
-            logging.exception("Unexpected server-side error.")
-
-            response = create_error_response(
-                500,
-                "Internal Server Error"
-            )
+            response = self._internal_error()
 
         try:
-            # Serialize the complete HTTP response.
             response_bytes = serialize_response(response)
-
-            # Send all response bytes to the client.
             client_socket.sendall(response_bytes)
 
-            logging.info(
-                "Response sent: HTTP %s (%s bytes)",
-                response.status_code,
-                len(response_bytes)
+        except Exception:
+            # Attempt a generic 500 response if serialization fails.
+            try:
+                error_bytes = serialize_response(
+                    self._internal_error()
+                )
+                client_socket.sendall(error_bytes)
+            except Exception:
+                pass
+
+        finally:
+            client_socket.close()
+
+    def serve_forever(self):
+        with socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM
+        ) as server_socket:
+
+            server_socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_REUSEADDR,
+                1
             )
 
-        except (OSError, ValueError, TypeError):
-            logging.exception("Failed to generate or send HTTP response.")
+            server_socket.bind(
+                (self.host, self.port)
+            )
 
-        logging.info(
-            "Client connection closed: %s:%s",
-            client_address[0],
-            client_address[1]
-        )
+            server_socket.listen()
 
-
-def start_server():
-    server_socket = socket.socket(
-        socket.AF_INET,
-        socket.SOCK_STREAM
-    )
-
-    users = []
-
-    try:
-        server_socket.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_REUSEADDR,
-            1
-        )
-
-        server_socket.bind((HOST, PORT))
-        server_socket.listen()
-
-        print(f"Server listening on {HOST}:{PORT}")
-
-        while True:
+            print(
+                f"Server listening on {self.host}:{self.port}"
+            )
             print("Waiting for incoming connections...")
 
-            client_socket, client_address = server_socket.accept()
+            while True:
+                client_socket, client_address = (
+                    server_socket.accept()
+                )
 
-            handle_client(
-                client_socket,
-                client_address,
-                users
-            )
+                print(
+                    f"Connection received from {client_address}"
+                )
 
-    except KeyboardInterrupt:
-        print("\nServer shutting down...")
+                self.handle_client(client_socket)
 
-    finally:
-        server_socket.close()
-        print("Server stopped.")
+
+# --------------------------------------------------
+# Application route handlers
+# --------------------------------------------------
+
+users = [
+    {
+        "id": 1,
+        "name": "Ali"
+    }
+]
+
+products = [
+    {
+        "id": 1,
+        "name": "Laptop"
+    },
+    {
+        "id": 2,
+        "name": "Keyboard"
+    }
+]
+
+
+def home(request):
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Python HTTP Server</title>
+    </head>
+    <body>
+        <h1>Hello World</h1>
+        <p>Welcome to my Python HTTP Server.</p>
+        <p>Phase 4: HTTP Routing System is working.</p>
+    </body>
+    </html>
+    """
+
+    return Response(
+        status_code=200,
+        headers={
+            "Content-Type": "text/html; charset=utf-8"
+        },
+        body=html.encode("utf-8"),
+    )
+
+
+def get_users(request):
+    return Response(
+        status_code=200,
+        headers={
+            "Content-Type": "application/json; charset=utf-8"
+        },
+        body=json.dumps(users).encode("utf-8"),
+    )
+
+
+def create_user(request):
+    try:
+        data = json.loads(request.body.decode("utf-8"))
+
+        if not isinstance(data, dict):
+            raise ValueError("Expected a JSON object.")
+
+        name = data.get("name")
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("A valid name is required.")
+
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return Response(
+            status_code=400,
+            headers={
+                "Content-Type": "text/plain; charset=utf-8"
+            },
+            body=b"400 - Invalid JSON request body",
+        )
+
+    user = {
+        "id": max(
+            (item["id"] for item in users),
+            default=0
+        ) + 1,
+        "name": name.strip(),
+    }
+
+    users.append(user)
+
+    return Response(
+        status_code=201,
+        headers={
+            "Content-Type": "application/json; charset=utf-8"
+        },
+        body=json.dumps(user).encode("utf-8"),
+    )
+
+
+def get_products(request):
+    return Response(
+        status_code=200,
+        headers={
+            "Content-Type": "application/json; charset=utf-8"
+        },
+        body=json.dumps(products).encode("utf-8"),
+    )
+
+
+def get_user(request, id):
+    user = next(
+        (
+            item for item in users
+            if item["id"] == int(id)
+        ),
+        None
+    )
+
+    if user is None:
+        return Response(
+            status_code=404,
+            headers={
+                "Content-Type": "text/plain; charset=utf-8"
+            },
+            body=b"404 - User Not Found",
+        )
+
+    return Response(
+        status_code=200,
+        headers={
+            "Content-Type": "application/json; charset=utf-8"
+        },
+        body=json.dumps(user).encode("utf-8"),
+    )
+
+
+def get_user_post(request, id, post_id):
+    return Response(
+        status_code=200,
+        headers={
+            "Content-Type": "application/json; charset=utf-8"
+        },
+        body=json.dumps({
+            "user_id": id,
+            "post_id": post_id,
+        }).encode("utf-8"),
+    )
+
+
+# --------------------------------------------------
+# Register application routes
+# --------------------------------------------------
+
+server = HTTPServer()
+
+server.get("/", home)
+server.get("/users", get_users)
+server.post("/users", create_user)
+server.get("/products", get_products)
+
+server.get("/users/:id", get_user)
+server.get(
+    "/users/:id/posts/:post_id",
+    get_user_post
+)
 
 
 if __name__ == "__main__":
-    start_server()
+    server.serve_forever()
