@@ -1,42 +1,36 @@
 # Python HTTP Server
 
-A basic HTTP server built using Python's standard socket library.
+A custom HTTP server built using Python's standard library.
+
+The project implements TCP communication, HTTP request parsing,
+HTTP response generation, and a modular routing system.
+
+No Flask, Django, FastAPI, Werkzeug, or third-party routing
+framework is used.
 
 ## Project Phases
 
 - Phase 1: TCP Server
 - Phase 2: HTTP Request Parsing
 - Phase 3: HTTP Response Generation
+- Phase 4: HTTP Routing System
 
-## Phase 3 Features
+## Project Structure
 
-- HTTP status line generation
-- HTTP response headers
-- HTML, JSON and plain text responses
-- UTF-8 response body encoding
-- Byte-accurate Content-Length
-- Connection: close
-- Complete response serialization
-- Socket integration using sendall()
-- Basic HTTP error handling
-
-## Supported Status Codes
-
-| Code | Reason |
-|------|--------|
-| 200 | OK |
-| 201 | Created |
-| 400 | Bad Request |
-| 404 | Not Found |
-| 500 | Internal Server Error |
-
-## Supported Content Types
-
-- text/html; charset=utf-8
-- application/json; charset=utf-8
-- text/plain; charset=utf-8
-
-## Run the Server
-
-```bash
-python server.py
+```text
+python-http-server/
+├── server.py
+├── http/
+│   ├── __init__.py
+│   ├── request.py
+│   ├── parser.py
+│   └── response.py
+├── routing/
+│   ├── __init__.py
+│   └── router.py
+├── tests/
+│   ├── __init__.py
+│   ├── test_parser.py
+│   ├── test_response.py
+│   └── test_router.py
+└── README.md
