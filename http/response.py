@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-import re
 
 
 STATUS_CODES = {
@@ -9,107 +8,73 @@ STATUS_CODES = {
     404: "Not Found",
     405: "Method Not Allowed",
     500: "Internal Server Error",
+    503: "Service Unavailable",
 }
-
-DEFAULT_CONTENT_TYPE = "text/plain; charset=utf-8"
-
-HEADER_NAME_PATTERN = re.compile(
-    r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$"
-)
 
 
 @dataclass
 class Response:
-    status_code: int
-    headers: dict[str, str] = field(default_factory=dict)
+    status_code: int = 200
     body: bytes | str = b""
+    headers: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if isinstance(self.body, str):
             self.body = self.body.encode("utf-8")
-        elif not isinstance(self.body, bytes):
-            raise TypeError("Response body must be str or bytes.")
+
+        if not isinstance(self.body, bytes):
+            raise TypeError("Response body must be bytes or str")
 
 
 def serialize_response(response: Response) -> bytes:
-    """
-    Convert a Response object into a complete HTTP response.
+    """Serialize a Response object into HTTP response bytes."""
 
-    Returns:
-        bytes: Serialized HTTP response.
-    """
-
-    # 1. Validate status code.
-    if (
-        isinstance(response.status_code, bool)
-        or response.status_code not in STATUS_CODES
-    ):
+    if response.status_code not in STATUS_CODES:
         raise ValueError(
-            f"Unsupported HTTP status code: {response.status_code}"
+            f"Unsupported status code: {response.status_code}"
         )
 
-    # 2. Validate response body.
-    if not isinstance(response.body, bytes):
-        raise TypeError("Response body must be bytes.")
+    status = STATUS_CODES[response.status_code]
 
-    # 3. Validate and normalize headers.
-    normalized_headers = {}
-
-    for name, value in response.headers.items():
-        if not isinstance(name, str) or not isinstance(value, str):
-            raise ValueError("Header names and values must be strings.")
-
-        if not HEADER_NAME_PATTERN.fullmatch(name):
-            raise ValueError(f"Invalid HTTP header name: {name}")
-
-        if any(ord(char) < 32 and char != "\t" for char in value):
-            raise ValueError("HTTP header contains invalid control characters.")
-
-        if "\r" in value or "\n" in value:
-            raise ValueError("HTTP header values cannot contain CRLF.")
-
-        normalized_name = name.lower()
-
-        if normalized_name in normalized_headers:
-            raise ValueError(f"Duplicate HTTP header: {name}")
-
-        if normalized_name in ("content-length", "connection"):
-            raise ValueError(
-                f"{name} is generated automatically and cannot be overridden."
-            )
-
-        normalized_headers[normalized_name] = (name, value)
-
-    # 4. Add default Content-Type when missing.
-    if "content-type" not in normalized_headers:
-        normalized_headers["content-type"] = (
-            "Content-Type",
-            DEFAULT_CONTENT_TYPE,
-        )
-
-    # 5. Generate status line.
-    reason_phrase = STATUS_CODES[response.status_code]
-
-    status_line = (
-        f"HTTP/1.1 {response.status_code} {reason_phrase}\r\n"
+    has_content_type = any(
+        name.lower() == "content-type"
+        for name in response.headers
     )
 
-    # 6. Generate response headers.
-    header_lines = []
+    headers = {
+        "Content-Length": str(len(response.body)),
+        "Connection": "close",
+    }
 
-    for original_name, value in normalized_headers.values():
-        header_lines.append(f"{original_name}: {value}\r\n")
+    if not has_content_type:
+        headers["Content-Type"] = "text/plain; charset=utf-8"
 
-    # 7. Generate automatic headers.
-    header_lines.append(f"Content-Length: {len(response.body)}\r\n")
-    header_lines.append("Connection: close\r\n")
+    headers.update(response.headers)
 
-    # 8. Serialize headers and body.
-    header_section = status_line + "".join(header_lines) + "\r\n"
+    for name, value in headers.items():
+        if (
+            "\r" in name
+            or "\n" in name
+            or "\r" in value
+            or "\n" in value
+        ):
+            raise ValueError("Invalid response header")
 
-    try:
-        header_bytes = header_section.encode("latin-1")
-    except UnicodeEncodeError as exc:
-        raise ValueError("HTTP headers must use Latin-1-compatible values.") from exc
+    if any(name.lower() == "content-length" for name in response.headers):
+        headers["Content-Length"] = str(len(response.body))
 
-    return header_bytes + response.body
+    if any(name.lower() == "connection" for name in response.headers):
+        headers["Connection"] = "close"
+
+    lines = [
+        f"HTTP/1.1 {response.status_code} {status}"
+    ]
+
+    lines.extend(
+        f"{name}: {value}"
+        for name, value in headers.items()
+    )
+
+    header_bytes = "\r\n".join(lines).encode("iso-8859-1")
+
+    return header_bytes + b"\r\n\r\n" + response.body
