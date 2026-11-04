@@ -200,18 +200,32 @@ class HTTPServer:
     def _handle_client(self, client_socket, client_address):
         """Process all HTTP requests on a single persistent connection.
 
-        The loop continues as long as the connection may stay open:
+        Implements HTTP/1.1 keep-alive: a single TCP connection can serve
+        multiple HTTP requests/responses.
 
-        1.  Set the socket timeout to the keep-alive idle timeout so the
-            server does not wait forever for a new request.
-        2.  Read one complete HTTP request through the buffered reader.
-        3.  Route it and build a response.
-        4.  Decide whether to keep the connection open (HTTP/1.1 default)
-            or close it (Connection: close, HTTP/1.0, error, limit reached).
-        5.  Send the response with the correct Connection header.
-        6.  Break if the connection must close; otherwise loop.
+        Connection lifecycle:
+        1. Accept client connection
+        2. Read HTTP request (including chunked body if present)
+        3. Route to handler, get response
+        4. Decide keep-alive based on:
+           - HTTP version (1.1 keep-alive by default, 1.0 doesn't)
+           - Connection header (Connection: close forces close)
+           - Request limit reached
+           - Handler/parsing errors
+        5. Send response with Connection header
+        6. If keep-alive: loop back to step 2
+        7. If close: break and cleanup
+
+        For chunked requests:
+        - BufferedRequestReader handles Transfer-Encoding: chunked
+        - Collects all chunks into request.body
+        - Validates chunk format (size in hex + CRLF + data + CRLF)
+        - Rejects oversized decoded bodies
+
+        Args:
+            client_socket: Connected TCP socket to client
+            client_address: (host, port) tuple
         """
-
         requests_served = 0
 
         reader = BufferedRequestReader(
@@ -221,16 +235,15 @@ class HTTPServer:
         )
 
         try:
-            # First request uses the normal socket_timeout so that a slow
-            # initial connection is treated just like it was before Phase 7.
+            # First request uses normal timeout; subsequent requests
+            # use keep-alive timeout (shorter to reclaim idle connections)
             client_socket.settimeout(self.socket_timeout)
 
             while True:
-                # --- Read one request -----------------------------------
+                # --- Read one complete request ---
                 try:
                     request = reader.read_request()
                 except socket.timeout:
-                    # No new request arrived within the idle window.
                     logger.debug(
                         "Keep-alive timeout on idle connection: %s",
                         client_address,
@@ -238,7 +251,7 @@ class HTTPServer:
                     break
 
                 if request is None:
-                    # Clean EOF — client closed the connection gracefully.
+                    # Clean EOF - client closed connection gracefully
                     logger.debug(
                         "Client closed connection: %s",
                         client_address,
@@ -256,15 +269,15 @@ class HTTPServer:
                     client_address,
                 )
 
-                # --- Decide connection policy BEFORE generating response --
-                # A response error can still force close; we finalise below.
+                # --- Decide connection policy BEFORE error handling ---
+                # We decide now so errors don't keep connection open
                 client_wants_keep_alive = should_keep_alive(request)
                 limit_reached = (
                     requests_served >= self.max_requests_per_connection
                 )
                 keep_connection = client_wants_keep_alive and not limit_reached
 
-                # --- Dispatch to handler --------------------------------
+                # --- Dispatch to router and handler ---
                 try:
                     response = self._dispatch_request(request)
                 except Exception:
@@ -275,7 +288,7 @@ class HTTPServer:
                     response = Response(500, "500 - Internal Server Error")
                     keep_connection = False
 
-                # --- Send response --------------------------------------
+                # --- Send HTTP response ---
                 try:
                     self._send_response(
                         client_socket,
@@ -290,12 +303,11 @@ class HTTPServer:
                     )
                     break
 
-                # --- Loop control ---------------------------------------
+                # --- Loop control ---
                 if not keep_connection:
                     break
 
-                # Switch to the keep-alive idle timeout for subsequent
-                # requests so the server reclaims idle connections promptly.
+                # Switch to keep-alive timeout for next request
                 client_socket.settimeout(self.keep_alive_timeout)
 
         except HTTPParseError as exc:
@@ -314,7 +326,6 @@ class HTTPServer:
                 pass
 
         except socket.timeout:
-            # Timeout on the very first request (no keep-alive yet).
             logger.debug("Initial request timeout: %s", client_address)
 
         except (ConnectionError, OSError) as exc:
