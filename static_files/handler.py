@@ -166,56 +166,114 @@ class StaticFileHandler:
             )
 
     def _resolve_path(self, requested_path: str) -> str:
-        """Resolve a URL path and prevent filesystem traversal."""
+        """Resolve a URL path with multiple security checks.
 
+        Prevents directory traversal attacks by:
+        1. URL-decoding the path exactly once
+        2. Rejecting null bytes and backslashes
+        3. Rejecting absolute paths and Windows drive paths
+        4. Using os.path.normpath to collapse .. and .
+        5. Converting to real path and checking containment in root
+
+        Attack examples that are blocked:
+        - ../../../etc/passwd (parent directory traversal)
+        - /etc/passwd (absolute path)
+        - C:\windows\system32 (Windows drive path)
+        - ./\.\.\./etc/passwd (bypasses with .)
+        - %2e%2e%2fetc%2fpasswd (double URL encoding)
+
+        Args:
+            requested_path: Raw URL path from request
+
+        Returns:
+            Absolute real path to file within root directory
+
+        Raises:
+            ValueError: If path contains dangerous characters/patterns
+            FileNotFoundError: If path resolves to nothing
+            PermissionError: If path escapes root directory
+        """
         if not isinstance(requested_path, str):
             raise ValueError("Invalid path")
 
-        # Strip query string and fragment.
+        # Strip query string and fragment from URL
         requested_path = urlsplit(requested_path).path
 
-        # Decode exactly once.
+        # Decode URL encoding (e.g., %20 -> space) exactly once
+        # This prevents double-decoding attacks
         decoded_bytes = unquote_to_bytes(requested_path)
         decoded_path = decoded_bytes.decode("utf-8", errors="strict")
 
-        # Reject dangerous characters and platform separators.
+        # Security Check 1: Reject null bytes (filesystem boundary)
         if "\x00" in decoded_path:
             raise ValueError("Invalid path")
 
+        # Security Check 2: Reject backslashes (Windows path separator)
         if "\\" in decoded_path:
             raise ValueError("Invalid path")
 
+        # Security Check 3: Reject absolute paths
         if decoded_path.startswith(("/", "\\")):
             raise ValueError("Absolute paths are not allowed")
 
-        # Reject Windows drive paths.
+        # Security Check 4: Reject Windows drive paths (C:, D:, etc.)
         if re.match(r"^[a-zA-Z]:", decoded_path):
             raise ValueError("Drive paths are not allowed")
 
+        # Normalize path: resolve .. and . components
+        # Example: users/../posts/1 -> users/posts/1
         normalized_path = os.path.normpath(decoded_path)
 
+        # Reject empty or current directory requests
         if normalized_path in ("", "."):
             raise FileNotFoundError
 
+        # Security Check 5: Prevent parent directory traversal
+        # After normpath, .. at start means trying to go above root
         if normalized_path == ".." or normalized_path.startswith(
             ".." + os.sep
         ):
             raise PermissionError
 
+        # Construct candidate path by joining with root
         candidate = os.path.abspath(
             os.path.join(self.root_directory, normalized_path)
         )
 
+        # Resolve symlinks and get real path
+        # This prevents symlink attacks pointing outside root
         resolved = os.path.realpath(candidate)
 
+        # Security Check 6: Final containment check using realpath
+        # Ensures resolved path is within root_directory
         if not self._is_inside_root(resolved):
             raise PermissionError
 
         return resolved
 
     def _is_inside_root(self, path: str) -> bool:
-        """Check canonical path containment using commonpath."""
+        """Check if a canonical path is contained within root directory.
 
+        Uses os.path.commonpath to verify the path is inside root
+        by comparing the common prefix. This prevents symlink attacks
+        where a symlink might point outside the allowed directory.
+
+        Example:
+        - root: /var/www/static
+        - path: /var/www/static/images/pic.jpg
+        - common: /var/www/static (matches root) -> True
+
+        Symlink attack example (blocked):
+        - path: /var/www/static/secret -> /etc/passwd
+        - After realpath: /etc/passwd
+        - common: /etc (doesn't match /var/www/static) -> False
+
+        Args:
+            path: Real path to check (should be from os.path.realpath)
+
+        Returns:
+            True if path is within root directory, False otherwise
+        """
         try:
             common = os.path.commonpath(
                 [self.root_directory, os.path.realpath(path)]
