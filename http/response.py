@@ -29,8 +29,16 @@ class Response:
             raise TypeError("Response body must be bytes or str")
 
 
-def serialize_response(response: Response) -> bytes:
-    """Serialize a Response object into HTTP response bytes."""
+def serialize_response(response: Response, keep_alive: bool = False) -> bytes:
+    """Serialize a Response object into HTTP response bytes.
+
+    The caller owns the connection policy and conveys it through
+    ``keep_alive``. The serialized response carries a single
+    ``Connection`` header reflecting that decision (``keep-alive`` or
+    ``close``). Any ``Connection`` header a handler may have set is
+    overridden, because the connection lifecycle is the server's
+    responsibility, not the handler's.
+    """
 
     if response.status_code not in STATUS_CODES:
         raise ValueError(
@@ -44,15 +52,28 @@ def serialize_response(response: Response) -> bytes:
         for name in response.headers
     )
 
+    connection_value = "keep-alive" if keep_alive else "close"
+
+    # Default Content-Length is derived from the body. A handler may
+    # override it (e.g. a HEAD request keeps the GET representation
+    # length while sending no body).
     headers = {
         "Content-Length": str(len(response.body)),
-        "Connection": "close",
     }
 
     if not has_content_type:
         headers["Content-Type"] = "text/plain; charset=utf-8"
 
     headers.update(response.headers)
+
+    # The connection lifecycle is owned by the server. Remove any
+    # Connection header a handler may have supplied (case-insensitively)
+    # and replace it with a single authoritative value.
+    for name in list(headers):
+        if name.lower() == "connection":
+            del headers[name]
+
+    headers["Connection"] = connection_value
 
     for name, value in headers.items():
         if (
@@ -62,13 +83,6 @@ def serialize_response(response: Response) -> bytes:
             or "\n" in value
         ):
             raise ValueError("Invalid response header")
-
-    # Honor an explicit Content-Length from the response (e.g. a HEAD
-    # request keeps the GET representation length while sending no body).
-    # When none is provided, the default computed from len(body) stands.
-
-    if any(name.lower() == "connection" for name in response.headers):
-        headers["Connection"] = "close"
 
     lines = [
         f"HTTP/1.1 {response.status_code} {status}"
