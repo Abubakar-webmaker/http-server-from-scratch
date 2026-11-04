@@ -3,8 +3,9 @@ import logging
 import socket
 import threading
 
-from http.parser import parse_request, HTTPParseError
+from http.parser import HTTPParseError
 from http.response import Response, serialize_response
+from http.keepalive import BufferedRequestReader, should_keep_alive
 from routing.router import Router
 from pathlib import Path
 from static_files.handler import StaticFileHandler
@@ -32,10 +33,18 @@ class HTTPServer:
         port=8080,
         max_clients=100,
         socket_timeout=5.0,
+        keep_alive_timeout=15.0,
+        max_requests_per_connection=100,
+        max_header_size=65536,
+        max_body_size=10 * 1024 * 1024,
     ):
         self.host = host
         self.port = port
         self.socket_timeout = socket_timeout
+        self.keep_alive_timeout = keep_alive_timeout
+        self.max_requests_per_connection = max_requests_per_connection
+        self.max_header_size = max_header_size
+        self.max_body_size = max_body_size
 
         self.router = Router()
 
@@ -168,126 +177,148 @@ class HTTPServer:
         with self.stats_lock:
             self.request_count += 1
 
-    def _send_response(self, client_socket, response):
-        response_bytes = serialize_response(response)
+    def _send_response(
+        self,
+        client_socket,
+        response: Response,
+        keep_alive: bool = False,
+    ) -> None:
+        """Serialize and send a response, honouring the keep-alive flag."""
+        response_bytes = serialize_response(response, keep_alive=keep_alive)
         client_socket.sendall(response_bytes)
 
-    def _read_request(self, client_socket):
-        """Read one HTTP request using Content-Length."""
+    def _dispatch_request(self, request):
+        """Route a parsed request to the right handler and return a Response."""
+        request_path = urlsplit(request.path).path
 
-        buffer = bytearray()
-        header_end = b"\r\n\r\n"
+        if request_path.startswith(STATIC_URL_PREFIX):
+            relative_path = request_path[len(STATIC_URL_PREFIX):]
+            return self.static_handler.handle(request, relative_path)
 
-        while header_end not in buffer:
-            chunk = client_socket.recv(4096)
-
-            if not chunk:
-                raise HTTPParseError("Client disconnected before headers")
-
-            buffer.extend(chunk)
-
-            if len(buffer) > 65536:
-                raise HTTPParseError("HTTP headers too large")
-
-        header_bytes, _, remaining = bytes(buffer).partition(header_end)
-
-        try:
-            header_lines = header_bytes.decode("iso-8859-1").split("\r\n")
-            content_length = 0
-
-            for line in header_lines[1:]:
-                if ":" not in line:
-                    raise HTTPParseError("Invalid HTTP header")
-
-                name, value = line.split(":", 1)
-
-                if name.strip().lower() == "content-length":
-                    content_length = int(value.strip())
-
-                    if content_length < 0:
-                        raise HTTPParseError("Invalid Content-Length")
-
-                if name.strip().lower() == "transfer-encoding":
-                    raise HTTPParseError(
-                        "Transfer-Encoding is not supported"
-                    )
-
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise HTTPParseError("Invalid HTTP headers") from exc
-
-        if content_length > 10 * 1024 * 1024:
-            raise HTTPParseError("Request body too large")
-
-        body = bytearray(remaining)
-
-        if len(body) > content_length:
-            raise HTTPParseError("Unexpected extra request data")
-
-        while len(body) < content_length:
-            chunk = client_socket.recv(
-                min(4096, content_length - len(body))
-            )
-
-            if not chunk:
-                raise HTTPParseError("Incomplete request body")
-
-            body.extend(chunk)
-
-        return parse_request(
-            header_bytes + header_end + bytes(body)
-        )
+        return self.router.dispatch(request)
 
     def _handle_client(self, client_socket, client_address):
-        """Process a single client's HTTP request."""
+        """Process all HTTP requests on a single persistent connection.
+
+        The loop continues as long as the connection may stay open:
+
+        1.  Set the socket timeout to the keep-alive idle timeout so the
+            server does not wait forever for a new request.
+        2.  Read one complete HTTP request through the buffered reader.
+        3.  Route it and build a response.
+        4.  Decide whether to keep the connection open (HTTP/1.1 default)
+            or close it (Connection: close, HTTP/1.0, error, limit reached).
+        5.  Send the response with the correct Connection header.
+        6.  Break if the connection must close; otherwise loop.
+        """
+
+        requests_served = 0
+
+        reader = BufferedRequestReader(
+            client_socket,
+            max_header_size=self.max_header_size,
+            max_body_size=self.max_body_size,
+        )
 
         try:
+            # First request uses the normal socket_timeout so that a slow
+            # initial connection is treated just like it was before Phase 7.
             client_socket.settimeout(self.socket_timeout)
 
-            request = self._read_request(client_socket)
+            while True:
+                # --- Read one request -----------------------------------
+                try:
+                    request = reader.read_request()
+                except socket.timeout:
+                    # No new request arrived within the idle window.
+                    logger.debug(
+                        "Keep-alive timeout on idle connection: %s",
+                        client_address,
+                    )
+                    break
 
-            self._increment_request_count()
+                if request is None:
+                    # Clean EOF — client closed the connection gracefully.
+                    logger.debug(
+                        "Client closed connection: %s",
+                        client_address,
+                    )
+                    break
 
-            logger.info(
-                "Request: %s %s from %s",
-                request.method,
-                request.path,
-                client_address,
-            )
+                requests_served += 1
+                self._increment_request_count()
 
-            request_path = urlsplit(request.path).path
-
-            if request_path.startswith(STATIC_URL_PREFIX):
-                relative_path = request_path[len(STATIC_URL_PREFIX):]
-                response = self.static_handler.handle(
-                    request,
-                    relative_path,
+                logger.info(
+                    "Request %d: %s %s from %s",
+                    requests_served,
+                    request.method,
+                    request.path,
+                    client_address,
                 )
-            else:
-                response = self.router.dispatch(request)
 
-            self._send_response(client_socket, response)
+                # --- Decide connection policy BEFORE generating response --
+                # A response error can still force close; we finalise below.
+                client_wants_keep_alive = should_keep_alive(request)
+                limit_reached = (
+                    requests_served >= self.max_requests_per_connection
+                )
+                keep_connection = client_wants_keep_alive and not limit_reached
+
+                # --- Dispatch to handler --------------------------------
+                try:
+                    response = self._dispatch_request(request)
+                except Exception:
+                    logger.exception(
+                        "Unhandled dispatch error for %s",
+                        client_address,
+                    )
+                    response = Response(500, "500 - Internal Server Error")
+                    keep_connection = False
+
+                # --- Send response --------------------------------------
+                try:
+                    self._send_response(
+                        client_socket,
+                        response,
+                        keep_alive=keep_connection,
+                    )
+                except OSError as exc:
+                    logger.debug(
+                        "Send error to %s: %s",
+                        client_address,
+                        exc,
+                    )
+                    break
+
+                # --- Loop control ---------------------------------------
+                if not keep_connection:
+                    break
+
+                # Switch to the keep-alive idle timeout for subsequent
+                # requests so the server reclaims idle connections promptly.
+                client_socket.settimeout(self.keep_alive_timeout)
 
         except HTTPParseError as exc:
-            
             logger.warning(
                 "Malformed request from %s: %s",
                 client_address,
                 exc,
             )
-
             try:
                 self._send_response(
                     client_socket,
                     Response(400, "400 - Bad Request"),
+                    keep_alive=False,
                 )
             except OSError:
                 pass
 
         except socket.timeout:
-            logger.warning("Client timed out: %s", client_address)
+            # Timeout on the very first request (no keep-alive yet).
+            logger.debug("Initial request timeout: %s", client_address)
 
         except (ConnectionError, OSError) as exc:
-            logger.warning(
+            logger.debug(
                 "Connection error from %s: %s",
                 client_address,
                 exc,
@@ -298,11 +329,11 @@ class HTTPServer:
                 "Unexpected client handler error: %s",
                 client_address,
             )
-
             try:
                 self._send_response(
                     client_socket,
                     Response(500, "500 - Internal Server Error"),
+                    keep_alive=False,
                 )
             except OSError:
                 pass
@@ -319,9 +350,7 @@ class HTTPServer:
                 pass
 
             with self.threads_lock:
-                self.active_threads.discard(
-                    threading.current_thread()
-                )
+                self.active_threads.discard(threading.current_thread())
 
             self.client_slots.release()
 
