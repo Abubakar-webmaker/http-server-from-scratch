@@ -6,6 +6,13 @@ import threading
 from http.parser import parse_request, HTTPParseError
 from http.response import Response, serialize_response
 from routing.router import Router
+from pathlib import Path
+from static_files.handler import StaticFileHandler
+from urllib.parse import urlsplit
+
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_URL_PREFIX = "/static/"
 
 
 logging.basicConfig(
@@ -31,6 +38,10 @@ class HTTPServer:
         self.socket_timeout = socket_timeout
 
         self.router = Router()
+
+        self.static_handler = StaticFileHandler(
+            root_directory=str(BASE_DIR / "static"),
+        )
 
         self.server_socket = None
         self.running = threading.Event()
@@ -243,7 +254,16 @@ class HTTPServer:
                 client_address,
             )
 
-            response = self.router.dispatch(request)
+            request_path = urlsplit(request.path).path
+
+            if request_path.startswith(STATIC_URL_PREFIX):
+                relative_path = request_path[len(STATIC_URL_PREFIX):]
+                response = self.static_handler.handle(
+                    request,
+                    relative_path,
+                )
+            else:
+                response = self.router.dispatch(request)
 
             self._send_response(client_socket, response)
 

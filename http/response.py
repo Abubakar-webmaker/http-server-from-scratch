@@ -4,9 +4,12 @@ from dataclasses import dataclass, field
 STATUS_CODES = {
     200: "OK",
     201: "Created",
+    304: "Not Modified",
     400: "Bad Request",
+    403: "Forbidden",
     404: "Not Found",
     405: "Method Not Allowed",
+    413: "Payload Too Large",
     500: "Internal Server Error",
     503: "Service Unavailable",
 }
@@ -60,8 +63,9 @@ def serialize_response(response: Response) -> bytes:
         ):
             raise ValueError("Invalid response header")
 
-    if any(name.lower() == "content-length" for name in response.headers):
-        headers["Content-Length"] = str(len(response.body))
+    # Honor an explicit Content-Length from the response (e.g. a HEAD
+    # request keeps the GET representation length while sending no body).
+    # When none is provided, the default computed from len(body) stands.
 
     if any(name.lower() == "connection" for name in response.headers):
         headers["Connection"] = "close"
