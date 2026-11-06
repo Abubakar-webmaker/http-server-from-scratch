@@ -13,6 +13,7 @@ import logging
 from urllib.parse import urlsplit
 
 from http.response import Response
+from core.middleware import MiddlewarePipeline
 
 logger = logging.getLogger("Dispatcher")
 
@@ -44,19 +45,24 @@ class RequestDispatcher:
         self.router = router
         self.static_handler = static_handler
         self.static_url_prefix = static_url_prefix
+        
+        # Initialize middleware pipeline
+        self.middleware_pipeline = MiddlewarePipeline()
 
-    def dispatch(self, request):
+    def dispatch(self, request, client_address=None):
         """Complete request→response pipeline.
         
         Pipeline stages:
         1. Extract path from URL
-        2. Determine route type (static vs app)
-        3. Call appropriate handler
-        4. Log request/response
-        5. Return response for serialization
+        2. Apply middleware pipeline (including rate limiting)
+        3. Determine route type (static vs app)
+        4. Call appropriate handler
+        5. Log request/response
+        6. Return response for serialization
         
         Args:
             request: Parsed HTTP request
+            client_address: Tuple (ip, port) of client connection (for rate limiting)
             
         Returns:
             Response object ready for serialization
@@ -74,30 +80,47 @@ class RequestDispatcher:
             request.path,
         )
 
-        # Stage 1: Determine route type and dispatch
-        try:
-            if request_path.startswith(self.static_url_prefix):
-                # Static file request
-                relative_path = request_path[len(self.static_url_prefix):]
-                response = self.static_handler.handle(
-                    request,
-                    relative_path,
+        # Stage 1: Apply middleware pipeline
+        # Middleware gets request and final handler, executes in chain order
+        def route_handler(req):
+            """Final handler after middleware processing."""
+            try:
+                if request_path.startswith(self.static_url_prefix):
+                    # Static file request
+                    relative_path = request_path[len(self.static_url_prefix):]
+                    return self.static_handler.handle(
+                        req,
+                        relative_path,
+                    )
+                else:
+                    # Application route request
+                    return self.router.dispatch(req)
+            except Exception as exc:
+                logger.exception(
+                    "Unhandled dispatch error for %s %s: %s",
+                    req.method,
+                    req.path,
+                    exc,
                 )
-            else:
-                # Application route request
-                response = self.router.dispatch(request)
+                return Response(500, "500 - Internal Server Error")
 
+        # Execute middleware pipeline with route handler as final target
+        try:
+            # Set client address in middleware for rate limiter access
+            self.middleware_pipeline.client_address = client_address
+            response = self.middleware_pipeline.execute(
+                request,
+                route_handler,
+            )
         except Exception as exc:
             logger.exception(
-                "Unhandled dispatch error for %s %s: %s",
-                request.method,
-                request.path,
+                "Middleware pipeline error: %s",
                 exc,
             )
-            response = Response(
-                500,
-                "500 - Internal Server Error",
-            )
+            response = Response(500, "500 - Internal Server Error")
+        finally:
+            # Clear client address after request
+            self.middleware_pipeline.client_address = None
 
         # Stage 2: Log response
         if hasattr(response, 'status_code'):
@@ -109,3 +132,11 @@ class RequestDispatcher:
             )
 
         return response
+
+    def register_middleware(self, middleware):
+        """Register a middleware function to the pipeline.
+        
+        Args:
+            middleware: A callable(request, next_handler) -> Response
+        """
+        self.middleware_pipeline.register(middleware)
