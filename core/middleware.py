@@ -24,7 +24,6 @@ class MiddlewarePipeline:
 
     def __init__(self) -> None:
         self._middleware_stack: List[MiddlewareFunc] = []
-        self.client_address = None  # Can be set before execute()
 
     def register(self, middleware: MiddlewareFunc) -> None:
         """Register a middleware function.
