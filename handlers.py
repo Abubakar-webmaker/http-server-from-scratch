@@ -91,6 +91,23 @@ def get_user(request, id):
     )
 
 
+def get_product(request, id):
+    """Handle GET /products/:id - return specific product by ID."""
+    product = next(
+        (item for item in products if str(item["id"]) == id),
+        None,
+    )
+
+    if product is None:
+        return Response(404, "Product not found")
+
+    return Response(
+        200,
+        json.dumps(product),
+        {"Content-Type": "application/json"},
+    )
+
+
 def get_user_post(request, id, post_id):
     """Handle GET /users/:id/posts/:post_id - return nested resource."""
     return Response(

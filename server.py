@@ -162,6 +162,7 @@ class HTTPServer:
         self.router.get("/users", handlers.get_users)
         self.router.post("/users", handlers.create_user)
         self.router.get("/products", handlers.get_products)
+        self.router.get("/products/:id", handlers.get_product)
         self.router.get("/users/:id", handlers.get_user)
         self.router.get(
             "/users/:id/posts/:post_id",
