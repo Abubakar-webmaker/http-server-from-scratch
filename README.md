@@ -57,56 +57,27 @@ A **production-ready HTTP/1.1 server** built from scratch in Python with concurr
 ## Wired Features (Production Integration)
 
 ### 1. **Middleware Pipeline** ✓ Wired
-The middleware pipeline orchestrates cross-cutting concerns before requests reach handlers:
-```python
-# Registered in server._register_middleware()
-dispatcher.register_middleware(rate_limit_middleware)
-```
-- **Location**: `dispatcher.py` (MiddlewarePipeline)
-- **Integration**: Middleware executes in order via `middleware_pipeline.execute()`
-- **Use Case**: Centralized rate limiting, logging, authentication
+The middleware pipeline orchestrates cross-cutting concerns before requests reach handlers. Provides centralized rate limiting, logging, and authentication.
+- **Location**: `dispatcher.py` (MiddlewarePipeline class)
+- **Use Case**: Pre-processing requests before routing
 
 ### 2. **Rate Limiter (100 req/60s per IP)** ✓ Wired
-Per-client IP rate limiting prevents abuse and ensures fair resource distribution:
-```python
-rate_limiter = RateLimiter(requests_per_window=100, window_seconds=60)
-# Check each request
-if not rate_limiter.is_allowed(client_ip):
-    return Response(429, "Too Many Requests")
-```
+Per-client IP rate limiting prevents abuse and ensures fair resource distribution. Limits each client to 100 requests per 60 seconds.
 - **Location**: `core/rate_limiter.py` (RateLimiter class)
 - **Middleware**: Registered in `server._register_middleware()`
-- **Client IP**: Extracted from `dispatcher.dispatch(request, client_address)`
-- **Response**: HTTP 429 with `Retry-After` header
+- **Response**: HTTP 429 with `Retry-After` header when limit exceeded
 
 ### 3. **Gzip Compression** ✓ Wired
-Automatic response compression for text content reduces bandwidth by ~70%:
-```python
-# In _send_response()
-response, was_compressed = compress_response(
-    response,
-    accept_encoding=accept_encoding
-)
-```
-- **Location**: `gzip_support/gzip_handler.py` (compress_response function)
-- **Integration**: Applied in `server._send_response()` before serialization
-- **Eligibility**: Text-based responses >1KB (JSON, HTML, CSS, JS, SVG)
-- **Header**: `Content-Encoding: gzip` (when compressed)
+Automatic response compression for text content reduces bandwidth by ~70%. Compresses JSON, HTML, CSS, JS responses larger than 1KB.
+- **Location**: `gzip_support/gzip_handler.py`
+- **Integration**: Applied before serialization
+- **Eligibility**: Text-based responses >1KB
 
 ### 4. **TLS/HTTPS Support** ✓ Wired
-Optional HTTPS support via Python's built-in SSL module:
-```python
-# Enable with:
-server = HTTPServer(
-    use_tls=True,
-    cert_file="/path/to/cert.pem",
-    key_file="/path/to/key.pem"
-)
-```
-- **Location**: `security/tls.py` (SSLContextFactory, wrap_socket_tls)
-- **Integration**: Optional wrapping in `server.__init__()`
+Optional HTTPS support via Python's built-in SSL module for secure communications.
+- **Location**: `security/tls.py`
 - **Certificates**: Self-signed or CA-signed (PEM format)
-- **Status**: Logged at startup: "Server listening on 127.0.0.1:8080 (TLS enabled)"
+- **Usage**: Pass `use_tls=True` with cert and key file paths to HTTPServer
 
 ### 5. **Threading Diagram** ✓ Added
 Multi-threaded concurrent client handling with connection pooling:
