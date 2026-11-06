@@ -23,7 +23,7 @@ from http.keepalive import BufferedRequestReader, should_keep_alive
 from gzip_support.gzip_handler import compress_response
 from routing.router import Router
 from static_files.handler import StaticFileHandler
-from dispatcher import RequestDispatcher
+from dispatcher import RequestDispatcher, get_client_address
 from core.rate_limiter import RateLimiter
 from security.tls import SSLContextFactory
 
@@ -178,16 +178,15 @@ class HTTPServer:
         def rate_limit_middleware(request, next_handler):
             """Rate limit middleware - enforce per-client request limits.
             
-            Extracts client IP from request or dispatcher context.
+            Extracts client IP from thread-local storage (thread-safe).
             Returns 429 (Too Many Requests) if limit exceeded.
             """
-            # Extract client IP from dispatcher context or request
+            # Get client IP from thread-local storage (thread-safe, no race conditions)
             client_ip = "0.0.0.0"
+            client_address = get_client_address()
             
-            # Try to get from dispatcher's middleware context (set by dispatcher.dispatch)
-            if (hasattr(self.dispatcher.middleware_pipeline, 'client_address') and 
-                self.dispatcher.middleware_pipeline.client_address):
-                client_ip = self.dispatcher.middleware_pipeline.client_address[0]
+            if client_address:
+                client_ip = client_address[0]
             
             # Fall back to X-Forwarded-For header if available
             if client_ip == "0.0.0.0" and hasattr(request, 'headers'):
@@ -279,19 +278,51 @@ class HTTPServer:
         """Process all HTTP requests on a single persistent connection.
 
         Socket management only - delegates to dispatcher for app logic.
-        Applies TLS wrapping if enabled.
+        Wraps socket with TLS if HTTPS enabled.
         
         Keeps connection open for multiple requests (keep-alive):
-        1. Read HTTP request (including chunked body if present)
-        2. Dispatch to application via self.dispatcher
-        3. Send response with Connection header
-        4. If keep-alive: loop back to step 1
-        5. If close: break and cleanup
+        1. Wrap socket with TLS if enabled
+        2. Read HTTP request (including chunked body if present)
+        3. Dispatch to application via self.dispatcher
+        4. Send response with Connection header
+        5. If keep-alive: loop back to step 2
+        6. If close: break and cleanup
 
         Args:
             client_socket: Connected TCP socket to client
             client_address: (host, port) tuple
         """
+        # Stage 0: Wrap socket with TLS if enabled
+        if self.ssl_context:
+            try:
+                from security.tls import wrap_socket_tls
+                client_socket, tls_ok = wrap_socket_tls(
+                    client_socket,
+                    self.ssl_context,
+                    server_side=True,
+                )
+                if not tls_ok:
+                    logger.warning("TLS handshake failed for %s", client_address)
+                    try:
+                        client_socket.close()
+                    except OSError:
+                        pass
+                    self.client_slots.release()
+                    with self.threads_lock:
+                        self.active_threads.discard(threading.current_thread())
+                    return
+                logger.debug("TLS connection established with %s", client_address)
+            except Exception as exc:
+                logger.exception("TLS wrapping error for %s: %s", client_address, exc)
+                try:
+                    client_socket.close()
+                except OSError:
+                    pass
+                self.client_slots.release()
+                with self.threads_lock:
+                    self.active_threads.discard(threading.current_thread())
+                return
+        
         requests_served = 0
 
         reader = BufferedRequestReader(
