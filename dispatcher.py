@@ -10,12 +10,16 @@ Separates application logic from transport layer (server.py).
 """
 
 import logging
+import threading
 from urllib.parse import urlsplit
 
 from http.response import Response
 from core.middleware import MiddlewarePipeline
 
 logger = logging.getLogger("Dispatcher")
+
+# Thread-local storage for client address (avoids race conditions)
+_thread_local = threading.local()
 
 
 class RequestDispatcher:
@@ -106,8 +110,9 @@ class RequestDispatcher:
 
         # Execute middleware pipeline with route handler as final target
         try:
-            # Set client address in middleware for rate limiter access
-            self.middleware_pipeline.client_address = client_address
+            # Store client address in thread-local storage (thread-safe)
+            # This avoids race conditions in concurrent requests
+            _thread_local.client_address = client_address
             response = self.middleware_pipeline.execute(
                 request,
                 route_handler,
@@ -119,8 +124,8 @@ class RequestDispatcher:
             )
             response = Response(500, "500 - Internal Server Error")
         finally:
-            # Clear client address after request
-            self.middleware_pipeline.client_address = None
+            # Clear client address from thread-local storage
+            _thread_local.client_address = None
 
         # Stage 2: Log response
         if hasattr(response, 'status_code'):
@@ -140,3 +145,12 @@ class RequestDispatcher:
             middleware: A callable(request, next_handler) -> Response
         """
         self.middleware_pipeline.register(middleware)
+
+
+def get_client_address():
+    """Get client address from thread-local storage (thread-safe).
+    
+    Returns:
+        Tuple (ip, port) or None if not set.
+    """
+    return getattr(_thread_local, 'client_address', None)
