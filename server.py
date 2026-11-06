@@ -20,9 +20,12 @@ import threading
 from http.parser import HTTPParseError
 from http.response import Response, serialize_response
 from http.keepalive import BufferedRequestReader, should_keep_alive
+from gzip_support.gzip_handler import compress_response
 from routing.router import Router
 from static_files.handler import StaticFileHandler
 from dispatcher import RequestDispatcher
+from core.rate_limiter import RateLimiter
+from security.tls import SSLContextFactory
 
 from pathlib import Path
 import handlers
@@ -63,6 +66,11 @@ class HTTPServer:
         max_requests_per_connection=100,
         max_header_size=65536,
         max_body_size=10 * 1024 * 1024,
+        use_tls=False,
+        cert_file=None,
+        key_file=None,
+        rate_limit_requests=100,
+        rate_limit_window=60,
     ):
         """Initialize HTTP server with configuration.
         
@@ -75,6 +83,11 @@ class HTTPServer:
             max_requests_per_connection: Max requests per connection
             max_header_size: Max header size in bytes
             max_body_size: Max request body size in bytes
+            use_tls: Enable TLS/HTTPS (default: False)
+            cert_file: Path to SSL certificate (PEM format)
+            key_file: Path to SSL private key (PEM format)
+            rate_limit_requests: Max requests per client per window (default: 100)
+            rate_limit_window: Rate limit window in seconds (default: 60)
         """
         self.host = host
         self.port = port
@@ -83,6 +96,28 @@ class HTTPServer:
         self.max_requests_per_connection = max_requests_per_connection
         self.max_header_size = max_header_size
         self.max_body_size = max_body_size
+        self.use_tls = use_tls
+        self.cert_file = cert_file
+        self.key_file = key_file
+        self.ssl_context = None
+
+        # Initialize TLS if enabled
+        if use_tls and cert_file and key_file:
+            try:
+                self.ssl_context = SSLContextFactory.create_context(
+                    cert_file=cert_file,
+                    key_file=key_file,
+                )
+                logger.info("TLS enabled with cert: %s", cert_file)
+            except Exception as exc:
+                logger.warning("TLS initialization failed: %s", exc)
+                self.ssl_context = None
+
+        # Initialize rate limiter
+        self.rate_limiter = RateLimiter(
+            requests_per_window=rate_limit_requests,
+            window_seconds=rate_limit_window,
+        )
 
         # Initialize routing
         self.router = Router()
@@ -99,6 +134,9 @@ class HTTPServer:
             static_handler=self.static_handler,
             static_url_prefix="/static/",
         )
+
+        # Register rate limiter middleware
+        self._register_middleware()
 
         # Socket and lifecycle management
         self.server_socket = None
@@ -130,6 +168,54 @@ class HTTPServer:
             handlers.get_user_post,
         )
 
+    def _register_middleware(self):
+        """Register middleware functions with the dispatcher.
+        
+        Middleware executes in registration order (left to right):
+        1. Rate limiting - enforce per-client request limits
+        """
+        
+        def rate_limit_middleware(request, next_handler):
+            """Rate limit middleware - enforce per-client request limits.
+            
+            Extracts client IP from request or dispatcher context.
+            Returns 429 (Too Many Requests) if limit exceeded.
+            """
+            # Extract client IP from dispatcher context or request
+            client_ip = "0.0.0.0"
+            
+            # Try to get from dispatcher's middleware context (set by dispatcher.dispatch)
+            if (hasattr(self.dispatcher.middleware_pipeline, 'client_address') and 
+                self.dispatcher.middleware_pipeline.client_address):
+                client_ip = self.dispatcher.middleware_pipeline.client_address[0]
+            
+            # Fall back to X-Forwarded-For header if available
+            if client_ip == "0.0.0.0" and hasattr(request, 'headers'):
+                for name, value in request.headers.items():
+                    if name.lower() == "x-forwarded-for":
+                        # X-Forwarded-For can have multiple IPs; use first
+                        client_ip = value.split(",")[0].strip()
+                        break
+            
+            logger.debug("Rate limiter: checking client %s", client_ip)
+            
+            # Check if client is rate limited
+            if not self.rate_limiter.is_allowed(client_ip):
+                retry_after = self.rate_limiter.get_retry_after(client_ip)
+                response = Response(429, "429 - Too Many Requests")
+                response.headers["Retry-After"] = str(retry_after)
+                logger.warning(
+                    "Rate limit exceeded for client %s (active clients: %d)",
+                    client_ip,
+                    self.rate_limiter.active_clients,
+                )
+                return response
+            
+            # Client is allowed, proceed to next middleware/handler
+            return next_handler(request)
+        
+        self.dispatcher.register_middleware(rate_limit_middleware)
+
     def get_stats(self):
         """Return a consistent snapshot of shared server statistics."""
 
@@ -154,15 +240,35 @@ class HTTPServer:
         self,
         client_socket,
         response,
+        request=None,
         keep_alive: bool = False,
     ) -> None:
         """Serialize and send a response over socket.
         
+        Applies gzip compression if client accepts it.
+        
         Args:
             client_socket: Connected socket to client
             response: Response object
+            request: Request object (to check Accept-Encoding header)
             keep_alive: Whether connection should stay open
         """
+        # Apply gzip compression if client accepts it
+        if request and hasattr(request, 'headers'):
+            accept_encoding = ""
+            for name, value in request.headers.items():
+                if name.lower() == "accept-encoding":
+                    accept_encoding = value
+                    break
+            
+            response, was_compressed = compress_response(
+                response,
+                accept_encoding=accept_encoding,
+            )
+            
+            if was_compressed:
+                logger.debug("Response compressed with gzip")
+        
         response_bytes = serialize_response(
             response,
             keep_alive=keep_alive,
@@ -173,6 +279,7 @@ class HTTPServer:
         """Process all HTTP requests on a single persistent connection.
 
         Socket management only - delegates to dispatcher for app logic.
+        Applies TLS wrapping if enabled.
         
         Keeps connection open for multiple requests (keep-alive):
         1. Read HTTP request (including chunked body if present)
@@ -235,7 +342,10 @@ class HTTPServer:
 
                 # --- Stage 3: Dispatch to application layer ---
                 try:
-                    response = self.dispatcher.dispatch(request)
+                    response = self.dispatcher.dispatch(
+                        request,
+                        client_address=client_address,
+                    )
                 except Exception:
                     logger.exception(
                         "Unhandled dispatch error for %s",
@@ -244,11 +354,12 @@ class HTTPServer:
                     response = Response(500, "500 - Internal Server Error")
                     keep_connection = False
 
-                # --- Stage 4: Send response ---
+                # --- Stage 4: Send response (with gzip compression) ---
                 try:
                     self._send_response(
                         client_socket,
                         response,
+                        request=request,
                         keep_alive=keep_connection,
                     )
                 except OSError as exc:
@@ -324,7 +435,10 @@ class HTTPServer:
             self.client_slots.release()
 
     def start(self):
-        """Start accepting incoming client connections."""
+        """Start accepting incoming client connections.
+        
+        If TLS is enabled, wrap the server socket with SSL/TLS.
+        """
 
         if self.running.is_set():
             raise RuntimeError("Server is already running")
@@ -349,9 +463,10 @@ class HTTPServer:
         self.running.set()
 
         logger.info(
-            "Server listening on %s:%s",
+            "Server listening on %s:%s%s",
             self.host,
             self.port,
+            " (TLS enabled)" if self.use_tls and self.ssl_context else "",
         )
 
         try:
