@@ -88,6 +88,8 @@ Multi-threaded concurrent client handling with connection pooling:
 
 ## Architecture
 
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/abubakar-webmaker/http-server-from-scratch?utm_source=readme&utm_medium=badge)
+
 ```
 Client Request (TCP)
        |
