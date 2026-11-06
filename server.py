@@ -1,4 +1,18 @@
-import json
+"""HTTP/1.1 Server - Transport Layer.
+
+This module handles ONLY network transport:
+- Socket creation and binding
+- Accepting client connections
+- Managing connection lifecycle (threading)
+- Keep-alive connection handling
+- Reading/writing data on sockets
+
+Application logic is delegated to:
+- dispatcher.py (request orchestration)
+- handlers.py (business logic)
+- routing/router.py (URL routing)
+"""
+
 import logging
 import socket
 import threading
@@ -7,14 +21,11 @@ from http.parser import HTTPParseError
 from http.response import Response, serialize_response
 from http.keepalive import BufferedRequestReader, should_keep_alive
 from routing.router import Router
-from pathlib import Path
 from static_files.handler import StaticFileHandler
-from urllib.parse import urlsplit
+from dispatcher import RequestDispatcher
 
-
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_URL_PREFIX = "/static/"
-
+from pathlib import Path
+import handlers
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,9 +34,24 @@ logging.basicConfig(
 
 logger = logging.getLogger("HTTPServer")
 
+BASE_DIR = Path(__file__).resolve().parent
+
 
 class HTTPServer:
-    """Threaded HTTP server using Python's built-in socket module."""
+    """HTTP/1.1 server - manages socket connections and request processing.
+    
+    Responsibilities:
+    - Socket management (bind, listen, accept)
+    - Thread pool for concurrent clients
+    - Connection lifecycle (keep-alive loop)
+    - Delegation to RequestDispatcher for app logic
+    
+    Does NOT handle:
+    - Routing (handled by Router)
+    - Request handlers (handlers.py)
+    - Request orchestration (Dispatcher)
+    - Static files (StaticFileHandler)
+    """
 
     def __init__(
         self,
@@ -38,6 +64,18 @@ class HTTPServer:
         max_header_size=65536,
         max_body_size=10 * 1024 * 1024,
     ):
+        """Initialize HTTP server with configuration.
+        
+        Args:
+            host: Bind address (default: localhost)
+            port: Bind port (default: 8080)
+            max_clients: Max concurrent connections (default: 100)
+            socket_timeout: Timeout for initial request (seconds)
+            keep_alive_timeout: Timeout for keep-alive requests (seconds)
+            max_requests_per_connection: Max requests per connection
+            max_header_size: Max header size in bytes
+            max_body_size: Max request body size in bytes
+        """
         self.host = host
         self.port = port
         self.socket_timeout = socket_timeout
@@ -46,115 +84,50 @@ class HTTPServer:
         self.max_header_size = max_header_size
         self.max_body_size = max_body_size
 
+        # Initialize routing
         self.router = Router()
+        self._register_routes()
 
+        # Initialize static file handler
         self.static_handler = StaticFileHandler(
             root_directory=str(BASE_DIR / "static"),
         )
 
+        # Initialize request dispatcher (app orchestration)
+        self.dispatcher = RequestDispatcher(
+            router=self.router,
+            static_handler=self.static_handler,
+            static_url_prefix="/static/",
+        )
+
+        # Socket and lifecycle management
         self.server_socket = None
         self.running = threading.Event()
         self.shutdown_event = threading.Event()
 
+        # Connection pooling
         self.client_slots = threading.BoundedSemaphore(max_clients)
-
         self.active_threads = set()
         self.threads_lock = threading.Lock()
 
+        # Statistics
         self.stats_lock = threading.Lock()
         self.request_count = 0
 
-        self._register_routes()
-
     def _register_routes(self):
-        """Register demonstration routes."""
-
-        users = [
-            {"id": 1, "name": "Ali"},
-        ]
-
-        products = [
-            {"id": 1, "name": "Laptop"},
-            {"id": 2, "name": "Keyboard"},
-        ]
-
-        def home(request):
-            return Response(
-                200,
-                "<html><body><h1>Hello World</h1></body></html>",
-                {"Content-Type": "text/html; charset=utf-8"},
-            )
-
-        def get_users(request):
-            return Response(
-                200,
-                json.dumps(users),
-                {"Content-Type": "application/json"},
-            )
-
-        def create_user(request):
-            try:
-                data = json.loads(request.body.decode("utf-8"))
-
-                if not isinstance(data, dict) or not data.get("name"):
-                    return Response(400, "Invalid user data")
-
-                user = {
-                    "id": len(users) + 1,
-                    "name": data["name"],
-                }
-
-                users.append(user)
-
-                return Response(
-                    201,
-                    json.dumps(user),
-                    {"Content-Type": "application/json"},
-                )
-
-            except (ValueError, UnicodeDecodeError):
-                return Response(400, "Invalid JSON")
-
-        def get_products(request):
-            return Response(
-                200,
-                json.dumps(products),
-                {"Content-Type": "application/json"},
-            )
-
-        def get_user(request, id):
-            user = next(
-                (item for item in users if str(item["id"]) == id),
-                None,
-            )
-
-            if user is None:
-                return Response(404, "User not found")
-
-            return Response(
-                200,
-                json.dumps(user),
-                {"Content-Type": "application/json"},
-            )
-
-        def get_user_post(request, id, post_id):
-            return Response(
-                200,
-                json.dumps({
-                    "user_id": id,
-                    "post_id": post_id,
-                }),
-                {"Content-Type": "application/json"},
-            )
-
-        self.router.get("/", home)
-        self.router.get("/users", get_users)
-        self.router.post("/users", create_user)
-        self.router.get("/products", get_products)
-        self.router.get("/users/:id", get_user)
+        """Register all application routes with their handlers.
+        
+        Handlers are imported from handlers.py module.
+        This keeps route registration in server.py but handlers in handlers.py.
+        """
+        self.router.get("/", handlers.home)
+        self.router.get("/users", handlers.get_users)
+        self.router.post("/users", handlers.create_user)
+        self.router.get("/products", handlers.get_products)
+        self.router.get("/users/:id", handlers.get_user)
         self.router.get(
             "/users/:id/posts/:post_id",
-            get_user_post,
+            handlers.get_user_post,
         )
 
     def get_stats(self):
@@ -180,47 +153,33 @@ class HTTPServer:
     def _send_response(
         self,
         client_socket,
-        response: Response,
+        response,
         keep_alive: bool = False,
     ) -> None:
-        """Serialize and send a response, honouring the keep-alive flag."""
-        response_bytes = serialize_response(response, keep_alive=keep_alive)
+        """Serialize and send a response over socket.
+        
+        Args:
+            client_socket: Connected socket to client
+            response: Response object
+            keep_alive: Whether connection should stay open
+        """
+        response_bytes = serialize_response(
+            response,
+            keep_alive=keep_alive,
+        )
         client_socket.sendall(response_bytes)
-
-    def _dispatch_request(self, request):
-        """Route a parsed request to the right handler and return a Response."""
-        request_path = urlsplit(request.path).path
-
-        if request_path.startswith(STATIC_URL_PREFIX):
-            relative_path = request_path[len(STATIC_URL_PREFIX):]
-            return self.static_handler.handle(request, relative_path)
-
-        return self.router.dispatch(request)
 
     def _handle_client(self, client_socket, client_address):
         """Process all HTTP requests on a single persistent connection.
 
-        Implements HTTP/1.1 keep-alive: a single TCP connection can serve
-        multiple HTTP requests/responses.
-
-        Connection lifecycle:
-        1. Accept client connection
-        2. Read HTTP request (including chunked body if present)
-        3. Route to handler, get response
-        4. Decide keep-alive based on:
-           - HTTP version (1.1 keep-alive by default, 1.0 doesn't)
-           - Connection header (Connection: close forces close)
-           - Request limit reached
-           - Handler/parsing errors
-        5. Send response with Connection header
-        6. If keep-alive: loop back to step 2
-        7. If close: break and cleanup
-
-        For chunked requests:
-        - BufferedRequestReader handles Transfer-Encoding: chunked
-        - Collects all chunks into request.body
-        - Validates chunk format (size in hex + CRLF + data + CRLF)
-        - Rejects oversized decoded bodies
+        Socket management only - delegates to dispatcher for app logic.
+        
+        Keeps connection open for multiple requests (keep-alive):
+        1. Read HTTP request (including chunked body if present)
+        2. Dispatch to application via self.dispatcher
+        3. Send response with Connection header
+        4. If keep-alive: loop back to step 1
+        5. If close: break and cleanup
 
         Args:
             client_socket: Connected TCP socket to client
@@ -235,12 +194,11 @@ class HTTPServer:
         )
 
         try:
-            # First request uses normal timeout; subsequent requests
-            # use keep-alive timeout (shorter to reclaim idle connections)
+            # First request uses normal timeout
             client_socket.settimeout(self.socket_timeout)
 
             while True:
-                # --- Read one complete request ---
+                # --- Stage 1: Read request ---
                 try:
                     request = reader.read_request()
                 except socket.timeout:
@@ -251,7 +209,6 @@ class HTTPServer:
                     break
 
                 if request is None:
-                    # Clean EOF - client closed connection gracefully
                     logger.debug(
                         "Client closed connection: %s",
                         client_address,
@@ -269,17 +226,16 @@ class HTTPServer:
                     client_address,
                 )
 
-                # --- Decide connection policy BEFORE error handling ---
-                # We decide now so errors don't keep connection open
+                # --- Stage 2: Decide connection policy ---
                 client_wants_keep_alive = should_keep_alive(request)
                 limit_reached = (
                     requests_served >= self.max_requests_per_connection
                 )
                 keep_connection = client_wants_keep_alive and not limit_reached
 
-                # --- Dispatch to router and handler ---
+                # --- Stage 3: Dispatch to application layer ---
                 try:
-                    response = self._dispatch_request(request)
+                    response = self.dispatcher.dispatch(request)
                 except Exception:
                     logger.exception(
                         "Unhandled dispatch error for %s",
@@ -288,7 +244,7 @@ class HTTPServer:
                     response = Response(500, "500 - Internal Server Error")
                     keep_connection = False
 
-                # --- Send HTTP response ---
+                # --- Stage 4: Send response ---
                 try:
                     self._send_response(
                         client_socket,
@@ -303,7 +259,7 @@ class HTTPServer:
                     )
                     break
 
-                # --- Loop control ---
+                # --- Stage 5: Loop control ---
                 if not keep_connection:
                     break
 
@@ -317,9 +273,10 @@ class HTTPServer:
                 exc,
             )
             try:
+                response = Response(400, "400 - Bad Request")
                 self._send_response(
                     client_socket,
-                    Response(400, "400 - Bad Request"),
+                    response,
                     keep_alive=False,
                 )
             except OSError:
@@ -341,9 +298,10 @@ class HTTPServer:
                 client_address,
             )
             try:
+                response = Response(500, "500 - Internal Server Error")
                 self._send_response(
                     client_socket,
-                    Response(500, "500 - Internal Server Error"),
+                    response,
                     keep_alive=False,
                 )
             except OSError:
