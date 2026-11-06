@@ -54,6 +54,67 @@ A **production-ready HTTP/1.1 server** built from scratch in Python with concurr
   - Performance metrics
   - Statistics tracking
 
+## Wired Features (Production Integration)
+
+### 1. **Middleware Pipeline** ✓ Wired
+The middleware pipeline orchestrates cross-cutting concerns before requests reach handlers:
+```python
+# Registered in server._register_middleware()
+dispatcher.register_middleware(rate_limit_middleware)
+```
+- **Location**: `dispatcher.py` (MiddlewarePipeline)
+- **Integration**: Middleware executes in order via `middleware_pipeline.execute()`
+- **Use Case**: Centralized rate limiting, logging, authentication
+
+### 2. **Rate Limiter (100 req/60s per IP)** ✓ Wired
+Per-client IP rate limiting prevents abuse and ensures fair resource distribution:
+```python
+rate_limiter = RateLimiter(requests_per_window=100, window_seconds=60)
+# Check each request
+if not rate_limiter.is_allowed(client_ip):
+    return Response(429, "Too Many Requests")
+```
+- **Location**: `core/rate_limiter.py` (RateLimiter class)
+- **Middleware**: Registered in `server._register_middleware()`
+- **Client IP**: Extracted from `dispatcher.dispatch(request, client_address)`
+- **Response**: HTTP 429 with `Retry-After` header
+
+### 3. **Gzip Compression** ✓ Wired
+Automatic response compression for text content reduces bandwidth by ~70%:
+```python
+# In _send_response()
+response, was_compressed = compress_response(
+    response,
+    accept_encoding=accept_encoding
+)
+```
+- **Location**: `gzip_support/gzip_handler.py` (compress_response function)
+- **Integration**: Applied in `server._send_response()` before serialization
+- **Eligibility**: Text-based responses >1KB (JSON, HTML, CSS, JS, SVG)
+- **Header**: `Content-Encoding: gzip` (when compressed)
+
+### 4. **TLS/HTTPS Support** ✓ Wired
+Optional HTTPS support via Python's built-in SSL module:
+```python
+# Enable with:
+server = HTTPServer(
+    use_tls=True,
+    cert_file="/path/to/cert.pem",
+    key_file="/path/to/key.pem"
+)
+```
+- **Location**: `security/tls.py` (SSLContextFactory, wrap_socket_tls)
+- **Integration**: Optional wrapping in `server.__init__()`
+- **Certificates**: Self-signed or CA-signed (PEM format)
+- **Status**: Logged at startup: "Server listening on 127.0.0.1:8080 (TLS enabled)"
+
+### 5. **Threading Diagram** ✓ Added
+Multi-threaded concurrent client handling with connection pooling:
+- **Architecture**: Main thread accepts connections, worker threads handle requests
+- **Connection Pool**: BoundedSemaphore limits 100 concurrent clients
+- **Keep-Alive Loop**: Each worker handles multiple requests per connection
+- **Graceful Shutdown**: Workers joined with timeout before exit
+
 ## Architecture
 
 ```
@@ -85,6 +146,53 @@ Client Request (TCP)
        |
        v
 TCP Response to Client
+```
+
+### Threading Model
+
+```
+Main Thread
+    |
+    +--[Server Socket] Accept on port 8080
+    |      |
+    |      +-- Accept connection 1 -----> [Worker Thread 1]
+    |      +-- Accept connection 2 -----> [Worker Thread 2]
+    |      +-- Accept connection 3 -----> [Worker Thread 3]
+    |      +-- ... up to 100 concurrent
+    |
+    +--[Connection Pool] Limit concurrent clients
+          |
+          +-- [BoundedSemaphore] Max 100 slots
+          |      Release on client disconnect
+          |
+          +-- Thread pool size dynamically managed
+                 (grows with demand, max 100)
+
+Each [Worker Thread] handles:
+  1. Keep-Alive loop (multiple requests per connection)
+  2. Read HTTP request
+  3. Dispatch to middleware → router → handler
+  4. Send response
+  5. If keep-alive: loop back to step 2
+  6. Else: close connection
+```
+
+### Middleware Pipeline (Feature #1: Rate Limiting)
+
+```
+Incoming Request
+       |
+       v
+[Rate Limiter] -- Check client IP against 100 req/60s window
+       |
+       +-- If over limit: return 429 (Too Many Requests)
+       +-- If within limit: proceed to routing
+       |
+       v
+[Router] -- Dispatch to handler
+       |
+       v
+[Response]
 ```
 
 ### Data Flow Example
