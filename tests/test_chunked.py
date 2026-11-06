@@ -187,9 +187,14 @@ class TestChunkedDecoder(unittest.TestCase):
         data = b"5\r\nHello\r\n0\r\n\r\n"
         body, decoder = decode_chunked(data)
 
-        # Try to use after completion
+        # Decoder is complete
         self.assertTrue(decoder.complete)
-        self.assertRaises(RuntimeError, lambda: decoder.decoded_body)  # Already decoded, but state is DONE
+        
+        # Accessing decoded_body should work (it's completed)
+        self.assertEqual(decoder.decoded_body, b"Hello")
+        
+        # But trying to feed more data should raise RuntimeError
+        self.assertRaises(RuntimeError, lambda: decoder.feed(b"more"))
 
 
 if __name__ == "__main__":
