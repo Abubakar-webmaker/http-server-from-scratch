@@ -33,9 +33,18 @@ class IntegrationTestServer:
         )
         self.thread.start()
 
+        # Wait for server socket to be initialized (with timeout)
+        timeout = 5
+        import time as time_module
+        start_time = time_module.time()
+        while self.server.server_socket is None:
+            if time_module.time() - start_time > timeout:
+                raise TimeoutError("Server failed to initialize socket")
+            time_module.sleep(0.01)
+
         # Extract actual port
         self.actual_port = self.server.server_socket.getsockname()[1]
-        time.sleep(0.3)
+        time.sleep(0.1)
 
     def stop(self):
         """Stop the server and wait for thread to finish."""

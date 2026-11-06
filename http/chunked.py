@@ -34,7 +34,13 @@ class ChunkedDecoder:
         self._trailer_headers = {}
 
     def feed(self, data: bytes) -> None:
-        """Add received data to the decoder."""
+        """Add received data to the decoder.
+        
+        Raises:
+            RuntimeError: If attempting to feed data after decoding is complete.
+        """
+        if self._state == "DONE":
+            raise RuntimeError("Decoder cannot be reused after completion")
         self._buffer.extend(data)
 
     @property

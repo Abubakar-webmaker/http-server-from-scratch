@@ -43,7 +43,12 @@ def should_compress(response: Response, min_size: int = MIN_COMPRESSION_SIZE) ->
         True if the response should be gzipped.
     """
     # Do not compress responses with no body
-    if not response.body or len(response.body) < min_size:
+    if not response.body:
+        return False
+    
+    # Get body size (body is always bytes after Response.__post_init__)
+    body_size = len(response.body)
+    if body_size < min_size:
         return False
 
     # Do not compress 204, 304, or HEAD responses
@@ -90,8 +95,10 @@ def parse_accept_encoding(accept_encoding: str) -> dict[str, float]:
         if not part:
             continue
 
-        # Parse "gzip;q=0.8"
-        match = re.match(r"([a-z\-]+)(?:;\s*q\s*=\s*([0-9.]+))?", part)
+        # Parse "gzip;q=0.8" or "gzip ; q = 0.8" (with spaces)
+        # Remove all spaces around = and ;
+        part = part.replace(" ", "")
+        match = re.match(r"([a-z\-]+)(?:;q=([0-9.]+))?", part)
 
         if match:
             encoding = match.group(1).lower()

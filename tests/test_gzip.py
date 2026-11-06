@@ -61,7 +61,8 @@ class TestGzipCompression(unittest.TestCase):
 
     def test_should_compress_json(self):
         """JSON content should be compressed."""
-        response = Response(200, '{"data": "' + "x" * 1000 + '"}')
+        # Create JSON body that exceeds MIN_COMPRESSION_SIZE (1024)
+        response = Response(200, '{"data": "' + "x" * 1050 + '"}')
         response.headers["Content-Type"] = "application/json"
         self.assertTrue(should_compress(response))
 
